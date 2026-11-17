@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage a local dsh-superagent service (one DSH profile, default `superagent`) without affecting other tmux sessions.
+"""Manage a local dsh-superagent service (one DSH profile, default `superagent`) in its own Herdr workspace, without affecting the workspaces you work in.
 
 `status`, `start`, and `restart` exit 0 while the service runs normally; 1 when it is stopped, duplicated, unreachable, or
 reporting a runtime error, which `restart` may fix; 2 when it runs while a component such as a Source reports an error;
@@ -99,6 +99,54 @@ PART_ERROR = 2
 SETUP_WAITS = 3
 
 
+def herdr(*args):
+    """Run a herdr CLI command and return its parsed JSON response."""
+    binary = shutil.which('herdr')
+    if not binary:
+        raise RuntimeError('herdr must be on PATH; start Herdr or install it first.')
+    result = subprocess.run([binary, *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError('herdr ' + ' '.join(args) + ' failed: ' + (result.stderr or result.stdout).strip())
+    if not result.stdout.strip():
+        return {}  # pane run, send-text and send-keys answer nothing on success
+    try:
+        value = json.loads(result.stdout)
+    except ValueError as error:
+        raise RuntimeError('herdr returned no JSON for ' + ' '.join(args)) from error
+    if value.get('error'):
+        raise RuntimeError('herdr ' + ' '.join(args) + ' failed: '
+                           + str(value['error'].get('message') or value['error']))
+    return value
+
+def workspace(profile):
+    """Return the Herdr workspace labelled `dsh-<profile>`, or None; Herdr closes it once its last pane exits."""
+    label = 'dsh-' + profile
+    for item in herdr('workspace', 'list').get('result', {}).get('workspaces', []):
+        if item.get('label') == label:
+            return item
+    return None
+
+
+def launch_pane(profile):
+    """Return the pane that runs the service, creating the workspace when it is gone.
+
+    A workspace whose pane already exists is reused only when that pane sits at a shell prompt; a pane left by a
+    running service is never reused, since `start` refuses duplicates before this point.
+    """
+    label = 'dsh-' + profile
+    current = workspace(profile)
+    if current is not None:
+        panes = herdr('pane', 'list', '--workspace', current['workspace_id']).get('result', {}).get('panes', [])
+        for pane in panes:
+            info = herdr('pane', 'process-info', '--pane', pane['pane_id']).get('result', {}).get('process_info', {})
+            foreground = info.get('foreground_processes') or [{}]
+            name = foreground[0].get('name') or ''
+            if name in ('zsh', 'bash', 'sh', 'fish', 'dash'):
+                return current['workspace_id'], pane['pane_id']
+    created = herdr('workspace', 'create', '--label', label, '--cwd', str(ROOT), '--no-focus').get('result', {})
+    return created['workspace']['workspace_id'], created['root_pane']['pane_id']
+
+
 def runtime_up(current):
     """Return whether the runtime is ready or paused awaiting operator action; a component still starting (such as history recovery) does not hold this up."""
     return current is not None and current['health'].get('runtime') in ('ready', 'paused')
@@ -157,32 +205,28 @@ def prune_logs(profile):
 
 
 def start(args):
-    session = 'dsh-' + args.profile
     pids = processes(args.profile)
     if len(pids) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
     if not pids:
         dsh = shutil.which('dsh')
-        if not dsh or not shutil.which('tmux'):
-            raise RuntimeError('Both dsh and tmux must be on PATH.')
-        exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
-                                capture_output=True).returncode == 0
+        if not dsh:
+            raise RuntimeError('dsh must be on PATH.')
         if state(args.url) is not None:
             raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
         stamp = time.strftime('%Y%m%d-%H%M%S')
         log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
         log.touch()
         prune_logs(args.profile)
-        # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
+        # `exec` replaces the pane's shell, so the pane ends with the service and Herdr drops the empty workspace.
         command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
-        # Reuse an existing tmux session without disturbing other windows.
-        target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
-        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
-                              check=True, capture_output=True, text=True).stdout.strip()
-        if pane.isdigit():
-            (control(args.profile) / 'service.pid').write_text(pane + '\n')
+        workspace_id, pane_id = launch_pane(args.profile)
+        herdr('pane', 'run', pane_id, command)
+        (control(args.profile) / 'herdr.json').write_text(
+            json.dumps({'workspace_id': workspace_id, 'pane_id': pane_id}) + '\n')
         print('Log: ' + str(log), flush=True)
+        print(f'Herdr workspace {workspace_id}, pane {pane_id}.', flush=True)
     else:
         (control(args.profile) / 'service.pid').write_text(f'{pids[0]}\n')
         print(f'dsh-superagent already running (PID {pids[0]}); no duplicate started.', flush=True)
@@ -190,7 +234,9 @@ def start(args):
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         current = state(args.url)
-        if processes(args.profile) and runtime_up(current):
+        pids = processes(args.profile)
+        if pids and runtime_up(current):
+            (control(args.profile) / 'service.pid').write_text(f'{pids[0]}\n')
             code = status(args)
             if current['setup']:
                 print('dsh-superagent is waiting for setup: ' + str(current['setup'].get('detail', '')))
@@ -210,7 +256,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['start', 'stop', 'restart', 'status'])
     parser.add_argument('--profile', default=os.environ.get('DSH_SUPERAGENT_PROFILE') or 'superagent',
-                        help='DSH profile that loads dsh-superagent; its tmux session is dsh-<profile>.')
+                        help='DSH profile that loads dsh-superagent; its Herdr workspace is dsh-<profile>.')
     parser.add_argument('--url', default=os.environ.get('DSH_SUPERAGENT_URL') or 'http://127.0.0.1:3082',
                         help='Health-check URL; override after changing the profile port.')
     parser.add_argument('--timeout', type=float, default=60, help='Startup timeout in seconds.')

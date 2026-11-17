@@ -1,4 +1,4 @@
-/** Tests for scripts/dsh-superagent using a temporary checkout path with spaces and stubbed ps, tmux, and dsh binaries. */
+/** Tests for scripts/dsh-superagent using a temporary checkout path with spaces and stubbed ps, herdr, and dsh binaries. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync }
   from 'node:fs'
@@ -36,11 +36,25 @@ while IFS= read -r line; do
   pid=\${line%% *}; kill -0 "$pid" 2>/dev/null || continue
   if [ -z "$want" ] || [ "$pid" = "$want" ]; then printf '%s\\n' "$line"; fi
 done < "$list"`)
-  // Log tmux invocations and simulate session creation by outputting the pane PID.
-  program('tmux', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/tmux.log'; echo --- >> '${root}/tmux.log'\n`
-    + `case "$1" in has-session) exit 1;; new-*) touch '${root}/launched'; cat '${root}/pane';; esac`)
+  // Herdr stub: log invocations, answer the workspace and pane API, and mark the launch.
+  writeFileSync(join(root, 'workspaces.json'), '{"result":{"workspaces":[]}}')
+  writeFileSync(join(root, 'panes.json'), '{"result":{"panes":[]}}')
+  writeFileSync(join(root, 'workspace-create.json'),
+    '{"result":{"workspace":{"workspace_id":"w1","label":"dsh-superagent"},"root_pane":{"pane_id":"w1:p1"}}}')
+  program('herdr', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/herdr.log'; echo --- >> '${root}/herdr.log'\n`
+    + `case "$1 $2" in
+  "workspace list") exec cat '${root}/workspaces.json';;
+  "workspace create") touch '${root}/launched'; exec cat '${root}/workspace-create.json';;
+  "pane list") exec cat '${root}/panes.json';;
+  "pane process-info") printf '%s' '{"result":{"process_info":{"foreground_processes":[{"name":"zsh"}]}}}'; exit 0;;
+  "pane run") touch '${root}/launched'; exit 0;;
+esac`)
   program('dsh', 'exit 0')
 })
+
+/** Herdr calls the script made, each as its argument words. */
+const herdrCalls = () => readFileSync(join(root, 'herdr.log'), 'utf8')
+  .split('---\n').filter(Boolean).map(call => call.replace(/\n$/, '').split('\n'))
 afterEach(() => {
   server?.close(); server = undefined
   for (const child of sleepers) child.kill()
@@ -92,12 +106,15 @@ it('records the service PID at start, and still refuses a second instance the sc
   const start = await run('start', '--url', url, '--timeout', '10')
   expect(start).toMatchObject({ code: 0, stdout: expect.stringContaining(`"pids": [\n    ${pid}\n  ]`) })
   expect(readFileSync(join(control('superagent'), 'service.pid'), 'utf8')).toBe(`${pid}\n`)
-  const tmux = readFileSync(join(root, 'tmux.log'), 'utf8').split('---\n').find(call => call.startsWith('new-session'))!.split('\n')
+  const calls = herdrCalls()
   // The checkout's path, which has a space, is one argument, and the log path inside it is quoted for the shell.
   const checkout = realpathSync(root)
-  expect(tmux).toEqual(expect.arrayContaining(['-P', '-F', '#{pane_pid}', '-c', checkout]))
+  expect(calls.find(call => call[0] === 'workspace' && call[1] === 'create'))
+    .toEqual(expect.arrayContaining(['--label', 'dsh-superagent', '--cwd', checkout]))
+  const launched = calls.find(call => call[0] === 'pane' && call[1] === 'run')!
+  expect(launched[2]).toBe('w1:p1')
   const log = new RegExp(`>> '${checkout}/\\.artifacts/dsh-superagent-superagent-\\d{8}-\\d{6}-\\d+\\.log' 2>&1$`)
-  expect(tmux.find(word => word.startsWith('umask 077; exec '))).toMatch(log)
+  expect(launched[3]).toMatch(log)
   const second = sleeper()
   started(service(pid), `${second} node node /opt/dsh --profile superagent`)
   const again = await run('start', '--url', url, '--timeout', '10')
@@ -196,20 +213,21 @@ it('refuses to start a service while no process runs it but something answers at
   const url = await answering(READY, true)
   expect(await run('start', '--url', url, '--timeout', '5'))
     .toMatchObject({ code: 1, stderr: expect.stringContaining('An existing orchestrator answers at this URL') })
-  expect(readFileSync(join(root, 'tmux.log'),
-    'utf8').split('---\n').filter(Boolean).map(call => call.split('\n')[0])).toEqual(['has-session'])
+  // The URL answers before any launch, so Herdr is never asked to create anything.
+  expect(existsSync(join(root, 'herdr.log'))).toBe(false)
 }, 20_000)
-it('starts the service in a new window of the profile\'s tmux session when the session exists', async () => {
-  program('tmux', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/tmux.log'; echo --- >> '${root}/tmux.log'\n`
-    + `case "$1" in has-session) exit 0;; new-*) touch '${root}/launched'; cat '${root}/pane';; esac`)
+it('reuses the workspace pane that sits at a shell prompt instead of creating a workspace', async () => {
+  writeFileSync(join(root, 'workspaces.json'),
+    '{"result":{"workspaces":[{"workspace_id":"w9","label":"dsh-superagent","pane_count":1}]}}')
+  writeFileSync(join(root, 'panes.json'), '{"result":{"panes":[{"pane_id":"w9:p1"}]}}')
   const url = await answering()
   const pid = sleeper()
   writeFileSync(join(root, 'pane'), `${pid}\n`)
   started(service(pid))
   expect(await run('start', '--url', url, '--timeout', '10')).toMatchObject({ code: 0 })
-  const calls = readFileSync(join(root, 'tmux.log'), 'utf8').split('---\n').map(call => call.split('\n'))
-  expect(calls.find(call => call[0] === 'new-window')).toEqual(expect.arrayContaining(['-t', '=dsh-superagent:']))
-  expect(calls.some(call => call[0] === 'new-session')).toBe(false)
+  const calls = herdrCalls()
+  expect(calls.some(call => call[0] === 'workspace' && call[1] === 'create')).toBe(false)
+  expect(calls.find(call => call[0] === 'pane' && call[1] === 'run')![2]).toBe('w9:p1')
 }, 20_000)
 it('exits 1 when the started service does not answer in time, and leaves its process running', async () => {
   const pid = sleeper()
